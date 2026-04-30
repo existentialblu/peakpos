@@ -60,8 +60,8 @@
 
 <h1>peak_pos<span class="sub">post-frenectomy watch · BRP from OSCAR</span></h1>
 
-<div id="drop">drop .edf files here (or click to pick)</div>
-<input id="picker" type="file" multiple accept=".edf" style="display:none">
+<div id="drop">drop .edf files or a folder here (or click to pick a folder)</div>
+<input id="picker" type="file" multiple webkitdirectory style="display:none">
 
 <div id="status"></div>
 
@@ -512,28 +512,65 @@ const countEl = document.getElementById('count');
 drop.addEventListener('click', () => picker.click());
 drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
 drop.addEventListener('dragleave', () => drop.classList.remove('over'));
-drop.addEventListener('drop', e => {
+drop.addEventListener('drop', async e => {
   e.preventDefault();
   drop.classList.remove('over');
-  ingestMany([...e.dataTransfer.files]);
+  setStatus('scanning…');
+  const items = [...e.dataTransfer.items];
+  const files = items.length && items[0].webkitGetAsEntry
+    ? await collectEdfFromItems(items)
+    : [...e.dataTransfer.files];
+  ingestMany(files);
 });
 picker.addEventListener('change', e => ingestMany([...e.target.files]));
 
+// Recursively walk dropped folders to find all .edf files.
+async function collectEdfFromItems(items) {
+  const out = [];
+  const entries = items.map(it => it.webkitGetAsEntry()).filter(Boolean);
+  for (const entry of entries) await walkEntry(entry, out);
+  return out;
+}
+
+async function walkEntry(entry, out) {
+  if (entry.isFile) {
+    if (/\.edf$/i.test(entry.name)) {
+      const f = await new Promise((res, rej) => entry.file(res, rej));
+      out.push(f);
+    }
+    return;
+  }
+  if (entry.isDirectory) {
+    const reader = entry.createReader();
+    while (true) {
+      const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+      if (batch.length === 0) break;
+      for (const sub of batch) await walkEntry(sub, out);
+    }
+  }
+}
+
 async function ingestMany(files) {
   const edfs = files.filter(f => /\.edf$/i.test(f.name));
-  if (edfs.length === 0) { setStatus('no .edf files in drop', true); return; }
-  let ok = 0, fail = 0;
+  if (edfs.length === 0) { setStatus('no .edf files found', true); return; }
+  let ok = 0, skipped = 0, fail = 0;
   for (let i = 0; i < edfs.length; i++) {
     setStatus(`processing ${i + 1}/${edfs.length}: ${edfs[i].name}`);
     try {
       await ingestFile(edfs[i]);
       ok++;
     } catch (err) {
-      fail++;
-      console.warn(edfs[i].name, err);
+      const msg = String(err);
+      if (/no Flow channel|no valid breaths/.test(msg)) skipped++;
+      else { fail++; console.warn(edfs[i].name, err); }
     }
+    // yield to UI so progress shows
+    if ((i & 3) === 3) await new Promise(r => setTimeout(r, 0));
   }
-  setStatus(`done. ingested ${ok}${fail ? `, ${fail} failed (see console)` : ''}`);
+  const parts = [`ingested ${ok}`];
+  if (skipped) parts.push(`${skipped} non-BRP skipped`);
+  if (fail) parts.push(`${fail} failed (see console)`);
+  setStatus(`done. ${parts.join(', ')}`);
   await refresh();
 }
 
