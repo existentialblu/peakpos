@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>peak_pos</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --fg: #e8e8e8;
+    --dim: #888;
+    --accent: #6ad1ff;
+    --baseline: #c08aff;
+    --target: #7fd17f;
+    --frenectomy: #ff7e9b;
+    --grid: #222;
+    --row-hover: #1a1d24;
+  }
+  html, body { background: var(--bg); color: var(--fg); margin: 0; font: 14px/1.4 ui-sans-serif, system-ui, sans-serif; }
+  body { max-width: 980px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 18px; font-weight: 500; letter-spacing: 0.04em; margin: 0 0 16px; }
+  h1 .sub { color: var(--dim); font-weight: 400; margin-left: 8px; font-size: 13px; }
+  #drop {
+    border: 1px dashed #444; border-radius: 6px; padding: 28px; text-align: center;
+    color: var(--dim); cursor: pointer; transition: border-color .15s, color .15s;
+  }
+  #drop.over { border-color: var(--accent); color: var(--fg); }
+  #status { margin: 12px 0; color: var(--dim); min-height: 1.4em; font-variant-numeric: tabular-nums; }
+  #status .err { color: #ff7e9b; }
+  svg.chart { width: 100%; height: 320px; display: block; margin: 16px 0; }
+  svg.chart .axis text { fill: var(--dim); font-size: 11px; }
+  svg.chart .axis line, svg.chart .axis path { stroke: var(--grid); fill: none; }
+  svg.chart .gridline { stroke: var(--grid); stroke-dasharray: 2 3; }
+  svg.chart .ref { stroke-dasharray: 4 4; fill: none; }
+  svg.chart .ref-baseline { stroke: var(--baseline); }
+  svg.chart .ref-target { stroke: var(--target); }
+  svg.chart .frenectomy { stroke: var(--frenectomy); stroke-dasharray: 2 3; fill: none; }
+  svg.chart .frenectomy-label { fill: var(--frenectomy); font-size: 10px; }
+  svg.chart .ref-label { font-size: 10px; }
+  svg.chart .iqr { stroke: var(--accent); stroke-opacity: .35; stroke-width: 4; stroke-linecap: round; }
+  svg.chart .pt { fill: var(--accent); }
+  svg.chart .line { stroke: var(--accent); stroke-opacity: .5; fill: none; }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--grid); font-weight: 400; }
+  th { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  td.num { text-align: right; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody tr.expanded { background: var(--row-hover); }
+  .hist { padding: 12px 10px 16px; }
+  .hist svg { width: 100%; height: 120px; display: block; }
+  .hist svg rect { fill: var(--accent); fill-opacity: .55; }
+  .hist svg .median { stroke: var(--baseline); stroke-width: 1.5; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 12px 0 4px; color: var(--dim); font-size: 12px; }
+  .toolbar button { background: transparent; border: 1px solid var(--grid); color: var(--dim); padding: 4px 10px; border-radius: 4px; cursor: pointer; font: inherit; }
+  .toolbar button:hover { color: var(--fg); border-color: #444; }
+  .empty { color: var(--dim); padding: 24px 0; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>peak_pos<span class="sub">post-frenectomy watch · BRP from OSCAR</span></h1>
+
+<div id="drop">drop .edf files here (or click to pick)</div>
+<input id="picker" type="file" multiple accept=".edf" style="display:none">
+
+<div id="status"></div>
+
+<div class="toolbar">
+  <span id="count"></span>
+  <span style="flex:1"></span>
+  <button id="export">export json</button>
+  <button id="clear">clear all</button>
+</div>
+
+<svg class="chart" id="chart" viewBox="0 0 900 320" preserveAspectRatio="none"></svg>
+
+<table id="sessions">
+  <thead><tr>
+    <th>night</th>
+    <th class="num">duration</th>
+    <th class="num">breaths</th>
+    <th class="num">peak_pos (median)</th>
+    <th class="num">IQR</th>
+    <th>file</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<script>
+'use strict';
+
+// ---------- EDF parser ----------
+// EDF spec: 256-byte main header, then 256 bytes per signal, then int16 LE data records.
+async function parseEdf(file) {
+  const buf = await file.arrayBuffer();
+  const view = new DataView(buf);
+  const dec = new TextDecoder('ascii');
+  const txt = (off, len) => dec.decode(new Uint8Array(buf, off, len)).trim();
+
+  const startdate = txt(168, 8);   // dd.mm.yy
+  const starttime = txt(176, 8);   // hh.mm.ss
+  const headerBytes = parseInt(txt(184, 8), 10);
+  const numRecords  = parseInt(txt(236, 8), 10);
+  const recDuration = parseFloat(txt(244, 8));
+  const ns          = parseInt(txt(252, 4), 10);
+
+  const labels = [], pmins = [], pmaxs = [], dmins = [], dmaxs = [], spr = [];
+  for (let i = 0; i < ns; i++) labels.push(txt(256 + 16 * i, 16));
+  let off = 256 + ns * 16 + ns * 80 + ns * 8;  // skip transducer + dim
+  for (let i = 0; i < ns; i++) pmins.push(parseFloat(txt(off + 8 * i, 8))); off += ns * 8;
+  for (let i = 0; i < ns; i++) pmaxs.push(parseFloat(txt(off + 8 * i, 8))); off += ns * 8;
+  for (let i = 0; i < ns; i++) dmins.push(parseFloat(txt(off + 8 * i, 8))); off += ns * 8;
+  for (let i = 0; i < ns; i++) dmaxs.push(parseFloat(txt(off + 8 * i, 8))); off += ns * 8;
+  off += ns * 80;  // skip prefiltering
+  for (let i = 0; i < ns; i++) spr.push(parseInt(txt(off + 8 * i, 8), 10));
+
+  const flowIdx = labels.findIndex(l => /^Flow/i.test(l));
+  if (flowIdx < 0) throw new Error('no Flow channel');
+
+  const recSamples = spr.reduce((a, b) => a + b, 0);
+  const flowSpr = spr[flowIdx];
+  const flowSr = flowSpr / recDuration;
+  const total = numRecords * flowSpr;
+
+  // pre-compute byte offset within record for flow
+  let flowRecByteOff = 0;
+  for (let s = 0; s < flowIdx; s++) flowRecByteOff += spr[s] * 2;
+
+  const dmin = dmins[flowIdx], dmax = dmaxs[flowIdx];
+  const pmin = pmins[flowIdx], pmax = pmaxs[flowIdx];
+  const scale = (pmax - pmin) / (dmax - dmin);
+
+  const flow = new Float64Array(total);
+  let w = 0;
+  for (let r = 0; r < numRecords; r++) {
+    const recBase = headerBytes + r * recSamples * 2 + flowRecByteOff;
+    for (let i = 0; i < flowSpr; i++) {
+      const d = view.getInt16(recBase + i * 2, true);
+      flow[w++] = (d - dmin) * scale + pmin;
+    }
+  }
+
+  // Date parsing: dd.mm.yy → ISO
+  const [dd, mm, yy] = startdate.split('.').map(s => parseInt(s, 10));
+  const fullYear = yy <= 84 ? 2000 + yy : 1900 + yy;
+  const [HH, MM, SS] = starttime.split('.').map(s => parseInt(s, 10));
+  const start = new Date(fullYear, mm - 1, dd, HH, MM, SS);
+
+  return {
+    flow, sr: flowSr,
+    start,
+    durationS: numRecords * recDuration,
+    fileName: file.name,
+  };
+}
+
+// ---------- breath segmenter (port of nightprint/breath_segmenter.py) ----------
+function movingAverageSame(data, win) {
+  const n = data.length;
+  const out = new Float64Array(n);
+  const half = Math.floor(win / 2);
+  // Match np.convolve(mode='same') with zero padding: divide by win, not count.
+  for (let i = 0; i < n; i++) {
+    let s = 0;
+    const lo = Math.max(0, i - half);
+    const hi = Math.min(n - 1, i + (win - 1 - half));
+    for (let k = lo; k <= hi; k++) s += data[k];
+    out[i] = s / win;
+  }
+  return out;
+}
+
+function segmentBreaths(flow, sr, opts = {}) {
+  const minBreathS = opts.minBreathS ?? 1.5;
+  const maxBreathS = opts.maxBreathS ?? 12.0;
+  const minPeakFlow = opts.minPeakFlow ?? 0.05;
+
+  const n = flow.length;
+  if (n < Math.floor(sr * minBreathS * 2)) return [];
+
+  const win = Math.max(3, Math.floor(sr * 0.1));
+  const smooth = movingAverageSame(flow, win);
+
+  // sign array (matches python: sign==0 → 1)
+  const sign = new Int8Array(n);
+  for (let i = 0; i < n; i++) sign[i] = smooth[i] >= 0 ? 1 : -1;
+
+  // inspiration onsets: negative→positive crossings, recorded at i+1
+  const inspOnsets = [];
+  for (let i = 0; i < n - 1; i++) {
+    if (sign[i] < 0 && sign[i + 1] > 0) inspOnsets.push(i + 1);
+  }
+  if (inspOnsets.length < 2) return [];
+
+  const minSamples = Math.round(minBreathS * sr);
+  const maxSamples = Math.round(maxBreathS * sr);
+
+  const breaths = [];
+  for (let bi = 0; bi < inspOnsets.length - 1; bi++) {
+    const s = inspOnsets[bi];
+    const e = inspOnsets[bi + 1];
+    const gap = e - s;
+    if (gap < minSamples || gap > maxSamples) continue;
+
+    // first positive→negative crossing within (s, e) = exhale onset
+    let eAbs = -1;
+    for (let i = s; i < e - 1; i++) {
+      if (sign[i] > 0 && sign[i + 1] < 0) { eAbs = i + 1; break; }
+    }
+    if (eAbs < 0) continue;
+
+    const inspLen = eAbs - s;
+    if (inspLen < 2 || (e - eAbs) < 2) continue;
+
+    // peak_in + peak_in_pos
+    let peakIn = -Infinity, peakIdx = 0;
+    for (let i = 0; i < inspLen; i++) {
+      const v = smooth[s + i];
+      if (v > peakIn) { peakIn = v; peakIdx = i; }
+    }
+    if (peakIn < minPeakFlow) continue;
+
+    const peakInPos = peakIdx / Math.max(1, inspLen - 1);
+    breaths.push(peakInPos);
+  }
+  return breaths;
+}
+
+// ---------- stats ----------
+function quantile(sorted, q) {
+  if (sorted.length === 0) return NaN;
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos), hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+// "night" assignment: hour < 12 → previous calendar day
+function nightKey(d) {
+  const adj = new Date(d);
+  if (adj.getHours() < 12) adj.setDate(adj.getDate() - 1);
+  const y = adj.getFullYear();
+  const m = String(adj.getMonth() + 1).padStart(2, '0');
+  const day = String(adj.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function fmtDuration(s) {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}` : `${m}m`;
+}
+
+// ---------- IndexedDB ----------
+const DB_NAME = 'peakpos';
+const STORE = 'sessions';
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        db.createObjectStore(STORE, { keyPath: 'sessionStart' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbPut(rec) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(rec);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function dbAll() {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbClear() {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ---------- ingest one file ----------
+async function ingestFile(file) {
+  const edf = await parseEdf(file);
+  const peaks = segmentBreaths(edf.flow, edf.sr);
+  if (peaks.length === 0) throw new Error(`${file.name}: no valid breaths`);
+
+  const sorted = peaks.slice().sort((a, b) => a - b);
+  const median = quantile(sorted, 0.5);
+  const q1 = quantile(sorted, 0.25);
+  const q3 = quantile(sorted, 0.75);
+
+  const sessionStart = edf.start.toISOString();
+  const rec = {
+    sessionStart,
+    night: nightKey(edf.start),
+    fileName: edf.fileName,
+    durationS: edf.durationS,
+    nBreaths: peaks.length,
+    median, q1, q3,
+    peaks: Float32Array.from(peaks),
+  };
+  await dbPut(rec);
+  return rec;
+}
+
+// ---------- night aggregation: longest BRP per night ----------
+function longestPerNight(sessions) {
+  const byNight = new Map();
+  for (const s of sessions) {
+    const cur = byNight.get(s.night);
+    if (!cur || s.durationS > cur.durationS) byNight.set(s.night, s);
+  }
+  return [...byNight.values()].sort((a, b) => a.night.localeCompare(b.night));
+}
+
+// ---------- chart ----------
+const FRENECTOMY = '2026-04-22';
+
+function dateToX(nightStr, x0, x1, w, pad) {
+  const t = Date.parse(nightStr + 'T00:00:00');
+  return pad + ((t - x0) / Math.max(1, x1 - x0)) * (w - 2 * pad);
+}
+
+function renderChart(nights) {
+  const svg = document.getElementById('chart');
+  const W = 900, H = 320, padL = 44, padR = 16, padT = 12, padB = 28;
+  svg.innerHTML = '';
+
+  if (nights.length === 0) {
+    svg.insertAdjacentHTML('beforeend',
+      `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="#666">drop a BRP file to start</text>`);
+    return;
+  }
+
+  const t0 = Date.parse(nights[0].night + 'T00:00:00');
+  const t1 = Date.parse(nights[nights.length - 1].night + 'T00:00:00');
+  // include FRENECTOMY in domain so the marker is always visible
+  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
+  const xMin = Math.min(t0, tF) - 12 * 3600 * 1000;
+  const xMax = Math.max(t1, tF) + 12 * 3600 * 1000;
+
+  // y range: fixed window centered on the typical peak_pos space
+  const yMin = 0.20, yMax = 0.90;
+  const yScale = v => padT + (1 - (v - yMin) / (yMax - yMin)) * (H - padT - padB);
+  const xScale = ts => padL + ((ts - xMin) / (xMax - xMin)) * (W - padL - padR);
+
+  // gridlines + y labels
+  const yTicks = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+  for (const yt of yTicks) {
+    const y = yScale(yt);
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="gridline" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>`);
+    svg.insertAdjacentHTML('beforeend',
+      `<text class="axis" x="${padL - 6}" y="${y + 3}" text-anchor="end">${yt.toFixed(1)}</text>`);
+  }
+
+  // x-axis ticks: monthly
+  const startD = new Date(xMin), endD = new Date(xMax);
+  let cursor = new Date(startD.getFullYear(), startD.getMonth(), 1);
+  while (cursor <= endD) {
+    const x = xScale(cursor.getTime());
+    if (x >= padL && x <= W - padR) {
+      svg.insertAdjacentHTML('beforeend',
+        `<line class="gridline" x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}"/>`);
+      const lbl = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}`;
+      svg.insertAdjacentHTML('beforeend',
+        `<text class="axis" x="${x}" y="${H - padB + 14}" text-anchor="middle">${lbl}</text>`);
+    }
+    cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+  }
+
+  // reference lines: 0.66 baseline, 0.40 target
+  const yBase = yScale(0.66), yTgt = yScale(0.40);
+  svg.insertAdjacentHTML('beforeend',
+    `<line class="ref ref-baseline" x1="${padL}" y1="${yBase}" x2="${W - padR}" y2="${yBase}"/>` +
+    `<text class="ref-label" fill="var(--baseline)" x="${W - padR - 4}" y="${yBase - 4}" text-anchor="end">0.66 baseline</text>` +
+    `<line class="ref ref-target" x1="${padL}" y1="${yTgt}" x2="${W - padR}" y2="${yTgt}"/>` +
+    `<text class="ref-label" fill="var(--target)" x="${W - padR - 4}" y="${yTgt - 4}" text-anchor="end">0.40 healthy</text>`);
+
+  // frenectomy marker
+  const xF = xScale(tF);
+  svg.insertAdjacentHTML('beforeend',
+    `<line class="frenectomy" x1="${xF}" y1="${padT}" x2="${xF}" y2="${H - padB}"/>` +
+    `<text class="frenectomy-label" x="${xF + 4}" y="${padT + 10}">frenectomy</text>`);
+
+  // line connecting medians
+  if (nights.length > 1) {
+    const path = nights.map((n, i) => {
+      const x = xScale(Date.parse(n.night + 'T00:00:00'));
+      const y = yScale(n.median);
+      return `${i === 0 ? 'M' : 'L'}${x},${y}`;
+    }).join(' ');
+    svg.insertAdjacentHTML('beforeend', `<path class="line" d="${path}"/>`);
+  }
+
+  // IQR whiskers + median dots
+  for (const n of nights) {
+    const x = xScale(Date.parse(n.night + 'T00:00:00'));
+    const yM = yScale(n.median);
+    const yQ1 = yScale(n.q1), yQ3 = yScale(n.q3);
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="iqr" x1="${x}" y1="${yQ1}" x2="${x}" y2="${yQ3}"/>` +
+      `<circle class="pt" cx="${x}" cy="${yM}" r="3"><title>${n.night}: median ${n.median.toFixed(3)}, IQR ${n.q1.toFixed(3)}–${n.q3.toFixed(3)}, ${n.nBreaths} breaths</title></circle>`);
+  }
+}
+
+// ---------- table ----------
+function renderTable(nights) {
+  const tbody = document.querySelector('#sessions tbody');
+  tbody.innerHTML = '';
+  if (nights.length === 0) {
+    tbody.insertAdjacentHTML('beforeend', `<tr><td colspan="6" class="empty">no sessions yet</td></tr>`);
+    return;
+  }
+  // newest first
+  const ordered = [...nights].sort((a, b) => b.night.localeCompare(a.night));
+  for (const n of ordered) {
+    const tr = document.createElement('tr');
+    tr.dataset.night = n.night;
+    tr.innerHTML = `
+      <td>${n.night}</td>
+      <td class="num">${fmtDuration(n.durationS)}</td>
+      <td class="num">${n.nBreaths.toLocaleString()}</td>
+      <td class="num">${n.median.toFixed(3)}</td>
+      <td class="num">${n.q1.toFixed(3)}–${n.q3.toFixed(3)}</td>
+      <td>${n.fileName}</td>
+    `;
+    tr.addEventListener('click', () => toggleHistogram(tr, n));
+    tbody.appendChild(tr);
+  }
+}
+
+function toggleHistogram(tr, n) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('hist-row')) {
+    next.remove();
+    tr.classList.remove('expanded');
+    return;
+  }
+  // close any open hist
+  document.querySelectorAll('tr.hist-row').forEach(r => r.remove());
+  document.querySelectorAll('tr.expanded').forEach(r => r.classList.remove('expanded'));
+  tr.classList.add('expanded');
+
+  const histTr = document.createElement('tr');
+  histTr.className = 'hist-row';
+  histTr.innerHTML = `<td colspan="6" class="hist"><svg viewBox="0 0 600 120" preserveAspectRatio="none"></svg></td>`;
+  tr.parentNode.insertBefore(histTr, tr.nextSibling);
+  drawHistogram(histTr.querySelector('svg'), n.peaks, n.median);
+}
+
+function drawHistogram(svg, peaks, median) {
+  const W = 600, H = 120, padL = 30, padR = 10, padT = 6, padB = 18;
+  const min = 0.0, max = 1.0, bins = 40;
+  const counts = new Array(bins).fill(0);
+  for (const p of peaks) {
+    const idx = Math.min(bins - 1, Math.max(0, Math.floor((p - min) / (max - min) * bins)));
+    counts[idx]++;
+  }
+  const peak = Math.max(...counts);
+  svg.innerHTML = '';
+  const xScale = v => padL + (v - min) / (max - min) * (W - padL - padR);
+  const yScale = c => padT + (1 - c / Math.max(1, peak)) * (H - padT - padB);
+  const bw = (W - padL - padR) / bins;
+  for (let i = 0; i < bins; i++) {
+    const x = padL + i * bw;
+    const y = yScale(counts[i]);
+    const h = (H - padB) - y;
+    if (h > 0) svg.insertAdjacentHTML('beforeend', `<rect x="${x}" y="${y}" width="${bw - 1}" height="${h}"/>`);
+  }
+  // x ticks at 0, .25, .5, .75, 1
+  for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+    const x = xScale(v);
+    svg.insertAdjacentHTML('beforeend',
+      `<line stroke="#222" x1="${x}" y1="${H - padB}" x2="${x}" y2="${H - padB + 3}"/>` +
+      `<text fill="#888" font-size="10" x="${x}" y="${H - padB + 14}" text-anchor="middle">${v}</text>`);
+  }
+  // median line
+  const xM = xScale(median);
+  svg.insertAdjacentHTML('beforeend',
+    `<line class="median" stroke="#c08aff" stroke-width="1.5" x1="${xM}" y1="${padT}" x2="${xM}" y2="${H - padB}"/>` +
+    `<text fill="#c08aff" font-size="10" x="${xM + 3}" y="${padT + 10}">${median.toFixed(3)}</text>`);
+}
+
+// ---------- UI glue ----------
+const drop = document.getElementById('drop');
+const picker = document.getElementById('picker');
+const status = document.getElementById('status');
+const countEl = document.getElementById('count');
+
+drop.addEventListener('click', () => picker.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  ingestMany([...e.dataTransfer.files]);
+});
+picker.addEventListener('change', e => ingestMany([...e.target.files]));
+
+async function ingestMany(files) {
+  const edfs = files.filter(f => /\.edf$/i.test(f.name));
+  if (edfs.length === 0) { setStatus('no .edf files in drop', true); return; }
+  let ok = 0, fail = 0;
+  for (let i = 0; i < edfs.length; i++) {
+    setStatus(`processing ${i + 1}/${edfs.length}: ${edfs[i].name}`);
+    try {
+      await ingestFile(edfs[i]);
+      ok++;
+    } catch (err) {
+      fail++;
+      console.warn(edfs[i].name, err);
+    }
+  }
+  setStatus(`done. ingested ${ok}${fail ? `, ${fail} failed (see console)` : ''}`);
+  await refresh();
+}
+
+function setStatus(msg, isErr = false) {
+  status.innerHTML = isErr ? `<span class="err">${msg}</span>` : msg;
+}
+
+async function refresh() {
+  const all = await dbAll();
+  const nights = longestPerNight(all);
+  countEl.textContent = nights.length === 0
+    ? ''
+    : `${nights.length} night${nights.length === 1 ? '' : 's'} · ${all.length} session${all.length === 1 ? '' : 's'} stored`;
+  renderChart(nights);
+  renderTable(nights);
+}
+
+document.getElementById('clear').addEventListener('click', async () => {
+  if (!confirm('delete all stored sessions? this cannot be undone.')) return;
+  await dbClear();
+  await refresh();
+  setStatus('cleared.');
+});
+
+document.getElementById('export').addEventListener('click', async () => {
+  const all = await dbAll();
+  // omit raw peaks array from export (large, recoverable from re-ingest)
+  const slim = all.map(({ peaks, ...rest }) => rest);
+  const blob = new Blob([JSON.stringify(slim, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `peakpos_${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+refresh();
+</script>
+</body>
+</html>
