@@ -26,19 +26,32 @@
   #drop.over { border-color: var(--accent); color: var(--fg); }
   #status { margin: 12px 0; color: var(--dim); min-height: 1.4em; font-variant-numeric: tabular-nums; }
   #status .err { color: #ff7e9b; }
-  svg.chart { width: 100%; height: 320px; display: block; margin: 16px 0; }
+  svg.chart { width: 100%; display: block; margin: 8px 0; }
+  svg.chart.peak { height: 240px; }
+  svg.chart.skew { height: 200px; }
+  svg.chart.phase { height: 360px; }
   svg.chart .axis text { fill: var(--dim); font-size: 11px; }
   svg.chart .axis line, svg.chart .axis path { stroke: var(--grid); fill: none; }
   svg.chart .gridline { stroke: var(--grid); stroke-dasharray: 2 3; }
   svg.chart .ref { stroke-dasharray: 4 4; fill: none; }
   svg.chart .ref-baseline { stroke: var(--baseline); }
   svg.chart .ref-target { stroke: var(--target); }
+  svg.chart .ref-zero { stroke: #555; stroke-dasharray: 2 3; }
   svg.chart .frenectomy { stroke: var(--frenectomy); stroke-dasharray: 2 3; fill: none; }
   svg.chart .frenectomy-label { fill: var(--frenectomy); font-size: 10px; }
   svg.chart .ref-label { font-size: 10px; }
   svg.chart .iqr { stroke: var(--accent); stroke-opacity: .35; stroke-width: 4; stroke-linecap: round; }
+  svg.chart .iqr-skew { stroke: #ffb86b; stroke-opacity: .35; stroke-width: 4; stroke-linecap: round; }
   svg.chart .pt { fill: var(--accent); }
+  svg.chart .pt-skew { fill: #ffb86b; }
   svg.chart .line { stroke: var(--accent); stroke-opacity: .5; fill: none; }
+  svg.chart .line-skew { stroke: #ffb86b; stroke-opacity: .5; fill: none; }
+  svg.chart .panel-title { fill: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  svg.chart .phase-line { stroke: #888; stroke-opacity: .25; fill: none; }
+  svg.chart .phase-pt-pre { fill-opacity: .55; stroke: none; }
+  svg.chart .phase-pt-post { stroke: var(--fg); stroke-width: 1; }
+  svg.chart .phase-pt-first { stroke: var(--frenectomy); stroke-width: 2; fill: none; }
+  .needs-backfill { color: #ffb86b; font-size: 12px; margin: 4px 0; }
   table { width: 100%; border-collapse: collapse; margin-top: 16px; font-variant-numeric: tabular-nums; }
   th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--grid); font-weight: 400; }
   th { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
@@ -58,7 +71,7 @@
 </head>
 <body>
 
-<h1>peak_pos<span class="sub">post-frenectomy watch · BRP from OSCAR</span></h1>
+<h1>peak_pos / insp_skew<span class="sub">post-frenectomy watch · BRP from OSCAR</span></h1>
 
 <div id="drop">drop .edf files or a folder here (or click to pick a folder)</div>
 <input id="picker" type="file" multiple webkitdirectory style="display:none">
@@ -72,15 +85,20 @@
   <button id="clear">clear all</button>
 </div>
 
-<svg class="chart" id="chart" viewBox="0 0 900 320" preserveAspectRatio="none"></svg>
+<div id="backfill" class="needs-backfill" style="display:none"></div>
+<svg class="chart peak" id="chart-peak" viewBox="0 0 900 240" preserveAspectRatio="none"></svg>
+<svg class="chart skew" id="chart-skew" viewBox="0 0 900 200" preserveAspectRatio="none"></svg>
+<svg class="chart phase" id="chart-phase" viewBox="0 0 900 360" preserveAspectRatio="none"></svg>
 
 <table id="sessions">
   <thead><tr>
     <th>night</th>
     <th class="num">duration</th>
     <th class="num">breaths</th>
-    <th class="num">peak_pos (median)</th>
-    <th class="num">IQR</th>
+    <th class="num">peak_pos</th>
+    <th class="num">peak IQR</th>
+    <th class="num">skew</th>
+    <th class="num">skew IQR</th>
     <th>file</th>
   </tr></thead>
   <tbody></tbody>
@@ -213,15 +231,44 @@ function segmentBreaths(flow, sr, opts = {}) {
     if (inspLen < 2 || (e - eAbs) < 2) continue;
 
     // peak_in + peak_in_pos
-    let peakIn = -Infinity, peakIdx = 0;
+    let peakIn = -Infinity, peakIdx = 0, flowSum = 0;
     for (let i = 0; i < inspLen; i++) {
       const v = smooth[s + i];
       if (v > peakIn) { peakIn = v; peakIdx = i; }
+      flowSum += v;
     }
     if (peakIn < minPeakFlow) continue;
 
     const peakInPos = peakIdx / Math.max(1, inspLen - 1);
-    breaths.push(peakInPos);
+
+    // insp_skew: 3rd standardized moment of inspiratory flow
+    // distribution over normalized time [0,1]. Negative = late-loaded
+    // (UARS / scooped); positive = front-loaded (healthy).
+    let inspSkew = 0;
+    if (flowSum > 0) {
+      const denom = Math.max(1, inspLen - 1);
+      let centroid = 0;
+      for (let i = 0; i < inspLen; i++) centroid += (i / denom) * smooth[s + i];
+      centroid /= flowSum;
+      let variance = 0;
+      for (let i = 0; i < inspLen; i++) {
+        const d = i / denom - centroid;
+        variance += d * d * smooth[s + i];
+      }
+      variance /= flowSum;
+      const std = Math.sqrt(variance);
+      if (std > 1e-6) {
+        let m3 = 0;
+        for (let i = 0; i < inspLen; i++) {
+          const d = i / denom - centroid;
+          m3 += d * d * d * smooth[s + i];
+        }
+        m3 /= flowSum;
+        inspSkew = m3 / (std * std * std);
+      }
+    }
+
+    breaths.push({ peakInPos, inspSkew });
   }
   return breaths;
 }
@@ -302,13 +349,14 @@ async function dbClear() {
 // ---------- ingest one file ----------
 async function ingestFile(file) {
   const edf = await parseEdf(file);
-  const peaks = segmentBreaths(edf.flow, edf.sr);
-  if (peaks.length === 0) throw new Error(`${file.name}: no valid breaths`);
+  const breaths = segmentBreaths(edf.flow, edf.sr);
+  if (breaths.length === 0) throw new Error(`${file.name}: no valid breaths`);
 
-  const sorted = peaks.slice().sort((a, b) => a - b);
-  const median = quantile(sorted, 0.5);
-  const q1 = quantile(sorted, 0.25);
-  const q3 = quantile(sorted, 0.75);
+  const peaks = breaths.map(b => b.peakInPos);
+  const skews = breaths.map(b => b.inspSkew);
+
+  const peaksSorted = peaks.slice().sort((a, b) => a - b);
+  const skewsSorted = skews.slice().sort((a, b) => a - b);
 
   const sessionStart = edf.start.toISOString();
   const rec = {
@@ -316,9 +364,17 @@ async function ingestFile(file) {
     night: nightKey(edf.start),
     fileName: edf.fileName,
     durationS: edf.durationS,
-    nBreaths: peaks.length,
-    median, q1, q3,
+    nBreaths: breaths.length,
+    // peak_pos aggregates (kept as median/q1/q3 for backwards compat)
+    median: quantile(peaksSorted, 0.5),
+    q1: quantile(peaksSorted, 0.25),
+    q3: quantile(peaksSorted, 0.75),
+    // insp_skew aggregates
+    skewMedian: quantile(skewsSorted, 0.5),
+    skewQ1: quantile(skewsSorted, 0.25),
+    skewQ3: quantile(skewsSorted, 0.75),
     peaks: Float32Array.from(peaks),
+    skews: Float32Array.from(skews),
   };
   await dbPut(rec);
   return rec;
@@ -342,10 +398,14 @@ function dateToX(nightStr, x0, x1, w, pad) {
   return pad + ((t - x0) / Math.max(1, x1 - x0)) * (w - 2 * pad);
 }
 
-function renderChart(nights) {
-  const svg = document.getElementById('chart');
-  const W = 900, H = 320, padL = 44, padR = 16, padT = 12, padB = 28;
+function renderTimeSeries(svgId, nights, opts) {
+  // opts: {H, yMin, yMax, yTicks, refs:[{value,color,label}], getMedian, getQ1, getQ3,
+  //        iqrClass, ptClass, lineClass, valueFmt, valueLabel, panelTitle}
+  const svg = document.getElementById(svgId);
+  const W = 900, H = opts.H, padL = 44, padR = 16, padT = 18, padB = 28;
   svg.innerHTML = '';
+  svg.insertAdjacentHTML('beforeend',
+    `<text class="panel-title" x="${padL}" y="${padT - 6}">${opts.panelTitle}</text>`);
 
   if (nights.length === 0) {
     svg.insertAdjacentHTML('beforeend',
@@ -353,75 +413,195 @@ function renderChart(nights) {
     return;
   }
 
+  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
   const t0 = Date.parse(nights[0].night + 'T00:00:00');
   const t1 = Date.parse(nights[nights.length - 1].night + 'T00:00:00');
-  // include FRENECTOMY in domain so the marker is always visible
-  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
   const xMin = Math.min(t0, tF) - 12 * 3600 * 1000;
   const xMax = Math.max(t1, tF) + 12 * 3600 * 1000;
 
-  // y range: fixed window centered on the typical peak_pos space
-  const yMin = 0.20, yMax = 0.90;
-  const yScale = v => padT + (1 - (v - yMin) / (yMax - yMin)) * (H - padT - padB);
+  const yScale = v => padT + (1 - (v - opts.yMin) / (opts.yMax - opts.yMin)) * (H - padT - padB);
   const xScale = ts => padL + ((ts - xMin) / (xMax - xMin)) * (W - padL - padR);
 
-  // gridlines + y labels
-  const yTicks = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
-  for (const yt of yTicks) {
+  for (const yt of opts.yTicks) {
     const y = yScale(yt);
     svg.insertAdjacentHTML('beforeend',
-      `<line class="gridline" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>`);
-    svg.insertAdjacentHTML('beforeend',
-      `<text class="axis" x="${padL - 6}" y="${y + 3}" text-anchor="end">${yt.toFixed(1)}</text>`);
+      `<line class="gridline" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>` +
+      `<text class="axis" x="${padL - 6}" y="${y + 3}" text-anchor="end">${opts.valueFmt(yt)}</text>`);
   }
 
-  // x-axis ticks: monthly
   const startD = new Date(xMin), endD = new Date(xMax);
   let cursor = new Date(startD.getFullYear(), startD.getMonth(), 1);
   while (cursor <= endD) {
     const x = xScale(cursor.getTime());
     if (x >= padL && x <= W - padR) {
       svg.insertAdjacentHTML('beforeend',
-        `<line class="gridline" x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}"/>`);
-      const lbl = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}`;
-      svg.insertAdjacentHTML('beforeend',
-        `<text class="axis" x="${x}" y="${H - padB + 14}" text-anchor="middle">${lbl}</text>`);
+        `<line class="gridline" x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}"/>` +
+        `<text class="axis" x="${x}" y="${H - padB + 14}" text-anchor="middle">${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}</text>`);
     }
     cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
   }
 
-  // reference lines: 0.66 baseline, 0.40 target
-  const yBase = yScale(0.66), yTgt = yScale(0.40);
-  svg.insertAdjacentHTML('beforeend',
-    `<line class="ref ref-baseline" x1="${padL}" y1="${yBase}" x2="${W - padR}" y2="${yBase}"/>` +
-    `<text class="ref-label" fill="var(--baseline)" x="${W - padR - 4}" y="${yBase - 4}" text-anchor="end">0.66 baseline</text>` +
-    `<line class="ref ref-target" x1="${padL}" y1="${yTgt}" x2="${W - padR}" y2="${yTgt}"/>` +
-    `<text class="ref-label" fill="var(--target)" x="${W - padR - 4}" y="${yTgt - 4}" text-anchor="end">0.40 healthy</text>`);
+  for (const r of opts.refs || []) {
+    const y = yScale(r.value);
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="ref ${r.cls}" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>` +
+      `<text class="ref-label" fill="${r.color}" x="${W - padR - 4}" y="${y - 4}" text-anchor="end">${r.label}</text>`);
+  }
 
-  // frenectomy marker
   const xF = xScale(tF);
   svg.insertAdjacentHTML('beforeend',
     `<line class="frenectomy" x1="${xF}" y1="${padT}" x2="${xF}" y2="${H - padB}"/>` +
     `<text class="frenectomy-label" x="${xF + 4}" y="${padT + 10}">frenectomy</text>`);
 
-  // line connecting medians
-  if (nights.length > 1) {
-    const path = nights.map((n, i) => {
+  // only nights with a non-NaN value contribute
+  const valid = nights.filter(n => Number.isFinite(opts.getMedian(n)));
+
+  if (valid.length > 1) {
+    const path = valid.map((n, i) => {
       const x = xScale(Date.parse(n.night + 'T00:00:00'));
-      const y = yScale(n.median);
+      const y = yScale(opts.getMedian(n));
       return `${i === 0 ? 'M' : 'L'}${x},${y}`;
     }).join(' ');
-    svg.insertAdjacentHTML('beforeend', `<path class="line" d="${path}"/>`);
+    svg.insertAdjacentHTML('beforeend', `<path class="${opts.lineClass}" d="${path}"/>`);
   }
 
-  // IQR whiskers + median dots
-  for (const n of nights) {
+  for (const n of valid) {
     const x = xScale(Date.parse(n.night + 'T00:00:00'));
-    const yM = yScale(n.median);
-    const yQ1 = yScale(n.q1), yQ3 = yScale(n.q3);
+    const yM = yScale(opts.getMedian(n));
+    const yQ1 = yScale(opts.getQ1(n)), yQ3 = yScale(opts.getQ3(n));
     svg.insertAdjacentHTML('beforeend',
-      `<line class="iqr" x1="${x}" y1="${yQ1}" x2="${x}" y2="${yQ3}"/>` +
-      `<circle class="pt" cx="${x}" cy="${yM}" r="3"><title>${n.night}: median ${n.median.toFixed(3)}, IQR ${n.q1.toFixed(3)}–${n.q3.toFixed(3)}, ${n.nBreaths} breaths</title></circle>`);
+      `<line class="${opts.iqrClass}" x1="${x}" y1="${yQ1}" x2="${x}" y2="${yQ3}"/>` +
+      `<circle class="${opts.ptClass}" cx="${x}" cy="${yM}" r="3"><title>${n.night}: ${opts.valueLabel} ${opts.valueFmt(opts.getMedian(n))}, IQR ${opts.valueFmt(opts.getQ1(n))}–${opts.valueFmt(opts.getQ3(n))}, ${n.nBreaths} breaths</title></circle>`);
+  }
+}
+
+function renderPeakChart(nights) {
+  renderTimeSeries('chart-peak', nights, {
+    H: 240,
+    yMin: 0.20, yMax: 0.90,
+    yTicks: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    refs: [
+      { value: 0.66, cls: 'ref-baseline', color: 'var(--baseline)', label: '0.66 baseline' },
+      { value: 0.40, cls: 'ref-target', color: 'var(--target)', label: '0.40 healthy' },
+    ],
+    getMedian: n => n.median,
+    getQ1: n => n.q1,
+    getQ3: n => n.q3,
+    iqrClass: 'iqr',
+    ptClass: 'pt',
+    lineClass: 'line',
+    valueFmt: v => v.toFixed(2),
+    valueLabel: 'peak_pos',
+    panelTitle: 'peak_pos · late-loaded ↑ / front-loaded ↓',
+  });
+}
+
+function renderSkewChart(nights) {
+  renderTimeSeries('chart-skew', nights, {
+    H: 200,
+    yMin: -1.2, yMax: 0.8,
+    yTicks: [-1.0, -0.5, 0.0, 0.5],
+    refs: [
+      { value: 0, cls: 'ref-zero', color: '#888', label: '0 symmetric' },
+    ],
+    getMedian: n => n.skewMedian,
+    getQ1: n => n.skewQ1,
+    getQ3: n => n.skewQ3,
+    iqrClass: 'iqr-skew',
+    ptClass: 'pt-skew',
+    lineClass: 'line-skew',
+    valueFmt: v => v.toFixed(2),
+    valueLabel: 'insp_skew',
+    panelTitle: 'insp_skew · late-loaded ↓ / front-loaded ↑',
+  });
+}
+
+function renderPhaseChart(nights) {
+  const svg = document.getElementById('chart-phase');
+  const W = 900, H = 360, padL = 56, padR = 24, padT = 22, padB = 36;
+  svg.innerHTML = '';
+  svg.insertAdjacentHTML('beforeend',
+    `<text class="panel-title" x="${padL}" y="${padT - 8}">phase space · peak_pos × insp_skew, color = time</text>`);
+
+  const valid = nights.filter(n => Number.isFinite(n.skewMedian));
+  if (valid.length === 0) {
+    svg.insertAdjacentHTML('beforeend',
+      `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="#666">no nights with skew data yet</text>`);
+    return;
+  }
+
+  const xMin = 0.20, xMax = 0.90;
+  const yMin = -1.2, yMax = 0.8;
+  const xScale = v => padL + (v - xMin) / (xMax - xMin) * (W - padL - padR);
+  const yScale = v => padT + (1 - (v - yMin) / (yMax - yMin)) * (H - padT - padB);
+
+  // x ticks
+  for (const xt of [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]) {
+    const x = xScale(xt);
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="gridline" x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}"/>` +
+      `<text class="axis" x="${x}" y="${H - padB + 14}" text-anchor="middle">${xt.toFixed(1)}</text>`);
+  }
+  svg.insertAdjacentHTML('beforeend',
+    `<text class="axis" x="${(padL + W - padR) / 2}" y="${H - padB + 28}" text-anchor="middle">peak_pos →</text>`);
+
+  // y ticks
+  for (const yt of [-1.0, -0.5, 0.0, 0.5]) {
+    const y = yScale(yt);
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="gridline" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"/>` +
+      `<text class="axis" x="${padL - 6}" y="${y + 3}" text-anchor="end">${yt.toFixed(1)}</text>`);
+  }
+  svg.insertAdjacentHTML('beforeend',
+    `<text class="axis" x="${padL - 36}" y="${(padT + H - padB) / 2}" transform="rotate(-90 ${padL - 36} ${(padT + H - padB) / 2})" text-anchor="middle">insp_skew →</text>`);
+
+  // reference cross
+  const xBase = xScale(0.66), yZero = yScale(0);
+  svg.insertAdjacentHTML('beforeend',
+    `<line class="ref ref-baseline" x1="${xBase}" y1="${padT}" x2="${xBase}" y2="${H - padB}"/>` +
+    `<line class="ref ref-zero" x1="${padL}" y1="${yZero}" x2="${W - padR}" y2="${yZero}"/>`);
+
+  // sort by date for connecting line
+  const ordered = valid.slice().sort((a, b) => a.night.localeCompare(b.night));
+  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
+  const tMin = Date.parse(ordered[0].night + 'T00:00:00');
+  const tMax = Date.parse(ordered[ordered.length - 1].night + 'T00:00:00');
+  const tSpan = Math.max(1, tMax - tMin);
+
+  // connecting line through all points in time order
+  if (ordered.length > 1) {
+    const path = ordered.map((n, i) => {
+      const x = xScale(n.median);
+      const y = yScale(n.skewMedian);
+      return `${i === 0 ? 'M' : 'L'}${x},${y}`;
+    }).join(' ');
+    svg.insertAdjacentHTML('beforeend', `<path class="phase-line" d="${path}"/>`);
+  }
+
+  // points: temporal gradient color (cool→warm), pre/post styling
+  let firstPostIdx = -1;
+  for (let i = 0; i < ordered.length; i++) {
+    if (Date.parse(ordered[i].night + 'T00:00:00') >= tF) { firstPostIdx = i; break; }
+  }
+
+  for (let i = 0; i < ordered.length; i++) {
+    const n = ordered[i];
+    const t = Date.parse(n.night + 'T00:00:00');
+    const frac = (t - tMin) / tSpan;
+    // hue: 220 (cool blue) → 30 (warm orange)
+    const hue = 220 - frac * 190;
+    const fill = `hsl(${hue} 70% 60%)`;
+    const x = xScale(n.median);
+    const y = yScale(n.skewMedian);
+    const isPost = t >= tF;
+    const r = isPost ? 5 : 3.5;
+    const cls = isPost ? 'phase-pt-post' : 'phase-pt-pre';
+    svg.insertAdjacentHTML('beforeend',
+      `<circle class="${cls}" cx="${x}" cy="${y}" r="${r}" fill="${fill}"><title>${n.night}: peak_pos ${n.median.toFixed(3)}, skew ${n.skewMedian.toFixed(3)}</title></circle>`);
+    if (i === firstPostIdx) {
+      svg.insertAdjacentHTML('beforeend',
+        `<circle class="phase-pt-first" cx="${x}" cy="${y}" r="${r + 3}"/>`);
+    }
   }
 }
 
@@ -430,20 +610,24 @@ function renderTable(nights) {
   const tbody = document.querySelector('#sessions tbody');
   tbody.innerHTML = '';
   if (nights.length === 0) {
-    tbody.insertAdjacentHTML('beforeend', `<tr><td colspan="6" class="empty">no sessions yet</td></tr>`);
+    tbody.insertAdjacentHTML('beforeend', `<tr><td colspan="8" class="empty">no sessions yet</td></tr>`);
     return;
   }
-  // newest first
   const ordered = [...nights].sort((a, b) => b.night.localeCompare(a.night));
   for (const n of ordered) {
     const tr = document.createElement('tr');
     tr.dataset.night = n.night;
+    const hasSkew = Number.isFinite(n.skewMedian);
+    const skewCell = hasSkew ? n.skewMedian.toFixed(3) : '<span style="color:#555">–</span>';
+    const skewIqr = hasSkew ? `${n.skewQ1.toFixed(3)}–${n.skewQ3.toFixed(3)}` : '<span style="color:#555">–</span>';
     tr.innerHTML = `
       <td>${n.night}</td>
       <td class="num">${fmtDuration(n.durationS)}</td>
       <td class="num">${n.nBreaths.toLocaleString()}</td>
       <td class="num">${n.median.toFixed(3)}</td>
       <td class="num">${n.q1.toFixed(3)}–${n.q3.toFixed(3)}</td>
+      <td class="num">${skewCell}</td>
+      <td class="num">${skewIqr}</td>
       <td>${n.fileName}</td>
     `;
     tr.addEventListener('click', () => toggleHistogram(tr, n));
@@ -458,23 +642,35 @@ function toggleHistogram(tr, n) {
     tr.classList.remove('expanded');
     return;
   }
-  // close any open hist
   document.querySelectorAll('tr.hist-row').forEach(r => r.remove());
   document.querySelectorAll('tr.expanded').forEach(r => r.classList.remove('expanded'));
   tr.classList.add('expanded');
 
+  const hasSkew = n.skews && n.skews.length;
   const histTr = document.createElement('tr');
   histTr.className = 'hist-row';
-  histTr.innerHTML = `<td colspan="6" class="hist"><svg viewBox="0 0 600 120" preserveAspectRatio="none"></svg></td>`;
+  histTr.innerHTML = `<td colspan="8" class="hist">
+    <div style="display:flex; gap:16px; align-items:flex-start">
+      <div style="flex:1">
+        <div style="color:#888; font-size:11px; margin-bottom:2px">peak_pos</div>
+        <svg id="hist-peak" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+      </div>
+      <div style="flex:1">
+        <div style="color:#888; font-size:11px; margin-bottom:2px">insp_skew${hasSkew ? '' : ' (re-ingest needed)'}</div>
+        <svg id="hist-skew" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+  </td>`;
   tr.parentNode.insertBefore(histTr, tr.nextSibling);
-  drawHistogram(histTr.querySelector('svg'), n.peaks, n.median);
+  drawHistogram(histTr.querySelector('#hist-peak'), n.peaks, n.median, 0, 1, '#6ad1ff');
+  if (hasSkew) drawHistogram(histTr.querySelector('#hist-skew'), n.skews, n.skewMedian, -1.5, 1.0, '#ffb86b');
 }
 
-function drawHistogram(svg, peaks, median) {
+function drawHistogram(svg, values, median, min, max, color) {
   const W = 600, H = 120, padL = 30, padR = 10, padT = 6, padB = 18;
-  const min = 0.0, max = 1.0, bins = 40;
+  const bins = 40;
   const counts = new Array(bins).fill(0);
-  for (const p of peaks) {
+  for (const p of values) {
     const idx = Math.min(bins - 1, Math.max(0, Math.floor((p - min) / (max - min) * bins)));
     counts[idx]++;
   }
@@ -487,19 +683,20 @@ function drawHistogram(svg, peaks, median) {
     const x = padL + i * bw;
     const y = yScale(counts[i]);
     const h = (H - padB) - y;
-    if (h > 0) svg.insertAdjacentHTML('beforeend', `<rect x="${x}" y="${y}" width="${bw - 1}" height="${h}"/>`);
+    if (h > 0) svg.insertAdjacentHTML('beforeend', `<rect x="${x}" y="${y}" width="${bw - 1}" height="${h}" fill="${color}" fill-opacity="0.55"/>`);
   }
-  // x ticks at 0, .25, .5, .75, 1
-  for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+  // x ticks: 5 across the range
+  for (let i = 0; i <= 4; i++) {
+    const v = min + (max - min) * (i / 4);
     const x = xScale(v);
     svg.insertAdjacentHTML('beforeend',
       `<line stroke="#222" x1="${x}" y1="${H - padB}" x2="${x}" y2="${H - padB + 3}"/>` +
-      `<text fill="#888" font-size="10" x="${x}" y="${H - padB + 14}" text-anchor="middle">${v}</text>`);
+      `<text fill="#888" font-size="10" x="${x}" y="${H - padB + 14}" text-anchor="middle">${v.toFixed(2)}</text>`);
   }
   // median line
   const xM = xScale(median);
   svg.insertAdjacentHTML('beforeend',
-    `<line class="median" stroke="#c08aff" stroke-width="1.5" x1="${xM}" y1="${padT}" x2="${xM}" y2="${H - padB}"/>` +
+    `<line stroke="#c08aff" stroke-width="1.5" x1="${xM}" y1="${padT}" x2="${xM}" y2="${H - padB}"/>` +
     `<text fill="#c08aff" font-size="10" x="${xM + 3}" y="${padT + 10}">${median.toFixed(3)}</text>`);
 }
 
@@ -584,7 +781,20 @@ async function refresh() {
   countEl.textContent = nights.length === 0
     ? ''
     : `${nights.length} night${nights.length === 1 ? '' : 's'} · ${all.length} session${all.length === 1 ? '' : 's'} stored`;
-  renderChart(nights);
+
+  // backfill banner: nights stored before insp_skew was tracked
+  const needsSkew = nights.filter(n => !Number.isFinite(n.skewMedian)).length;
+  const banner = document.getElementById('backfill');
+  if (needsSkew > 0) {
+    banner.style.display = '';
+    banner.textContent = `${needsSkew} night${needsSkew === 1 ? '' : 's'} stored without insp_skew. Drop your DATALOG folder again to backfill.`;
+  } else {
+    banner.style.display = 'none';
+  }
+
+  renderPeakChart(nights);
+  renderSkewChart(nights);
+  renderPhaseChart(nights);
   renderTable(nights);
 }
 
