@@ -63,9 +63,12 @@
   .hist svg { width: 100%; height: 120px; display: block; }
   .hist svg rect { fill: var(--accent); fill-opacity: .55; }
   .hist svg .median { stroke: var(--baseline); stroke-width: 1.5; }
-  .toolbar { display: flex; gap: 8px; align-items: center; margin: 12px 0 4px; color: var(--dim); font-size: 12px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin: 12px 0 4px; color: var(--dim); font-size: 12px; flex-wrap: wrap; }
   .toolbar button { background: transparent; border: 1px solid var(--grid); color: var(--dim); padding: 4px 10px; border-radius: 4px; cursor: pointer; font: inherit; }
   .toolbar button:hover { color: var(--fg); border-color: #444; }
+  .toolbar button.active { color: var(--fg); border-color: var(--accent); }
+  svg.chart.peak, svg.chart.skew { cursor: crosshair; }
+  svg.chart .zoom-overlay { fill: rgba(106, 209, 255, 0.12); stroke: rgba(106, 209, 255, 0.5); stroke-width: 1; pointer-events: none; }
   .empty { color: var(--dim); padding: 24px 0; text-align: center; }
 </style>
 </head>
@@ -81,9 +84,12 @@
 <div class="toolbar">
   <span id="count"></span>
   <span style="flex:1"></span>
+  <button id="zoom-post">post-op only</button>
+  <button id="zoom-reset" style="display:none">reset zoom</button>
   <button id="export">export json</button>
   <button id="clear">clear all</button>
 </div>
+<div style="color:var(--dim); font-size:11px; margin-bottom:4px">drag horizontally on a time chart to zoom · double-click to reset</div>
 
 <div id="backfill" class="needs-backfill" style="display:none"></div>
 <svg class="chart peak" id="chart-peak" viewBox="0 0 900 240" preserveAspectRatio="none"></svg>
@@ -398,11 +404,55 @@ function dateToX(nightStr, x0, x1, w, pad) {
   return pad + ((t - x0) / Math.max(1, x1 - x0)) * (w - 2 * pad);
 }
 
+// Module state for zoom + redraw
+let zoomDomain = null;  // {tMin, tMax} | null
+let cachedNights = [];
+const TS_LAYOUT = { W: 900, padL: 44, padR: 16, padT: 18, padB: 28 };
+
+function timeDomainFor(nights) {
+  if (zoomDomain) return [zoomDomain.tMin, zoomDomain.tMax];
+  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
+  const t0 = Date.parse(nights[0].night + 'T00:00:00');
+  const t1 = Date.parse(nights[nights.length - 1].night + 'T00:00:00');
+  return [Math.min(t0, tF) - 12 * 3600 * 1000, Math.max(t1, tF) + 12 * 3600 * 1000];
+}
+
+function timeTicks(xMin, xMax) {
+  // pick tick density based on range
+  const dayMs = 86400 * 1000;
+  const range = xMax - xMin;
+  const ticks = [];
+  if (range > 180 * dayMs) {
+    let cur = new Date(xMin); cur = new Date(cur.getFullYear(), cur.getMonth(), 1);
+    while (cur.getTime() <= xMax) {
+      ticks.push({ t: cur.getTime(), label: `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, '0')}` });
+      cur = new Date(cur.getFullYear(), cur.getMonth() + 1, 1);
+    }
+  } else if (range > 30 * dayMs) {
+    // weekly, anchored to Sundays
+    let cur = new Date(xMin);
+    cur.setDate(cur.getDate() - cur.getDay());
+    cur.setHours(0, 0, 0, 0);
+    while (cur.getTime() <= xMax) {
+      ticks.push({ t: cur.getTime(), label: `${String(cur.getMonth() + 1).padStart(2, '0')}-${String(cur.getDate()).padStart(2, '0')}` });
+      cur.setDate(cur.getDate() + 7);
+    }
+  } else {
+    let cur = new Date(xMin);
+    cur.setHours(0, 0, 0, 0);
+    cur.setDate(cur.getDate() + 1);
+    while (cur.getTime() <= xMax) {
+      ticks.push({ t: cur.getTime(), label: `${String(cur.getMonth() + 1).padStart(2, '0')}-${String(cur.getDate()).padStart(2, '0')}` });
+      cur.setDate(cur.getDate() + 1);
+    }
+  }
+  return ticks;
+}
+
 function renderTimeSeries(svgId, nights, opts) {
-  // opts: {H, yMin, yMax, yTicks, refs:[{value,color,label}], getMedian, getQ1, getQ3,
-  //        iqrClass, ptClass, lineClass, valueFmt, valueLabel, panelTitle}
   const svg = document.getElementById(svgId);
-  const W = 900, H = opts.H, padL = 44, padR = 16, padT = 18, padB = 28;
+  const { W, padL, padR, padT, padB } = TS_LAYOUT;
+  const H = opts.H;
   svg.innerHTML = '';
   svg.insertAdjacentHTML('beforeend',
     `<text class="panel-title" x="${padL}" y="${padT - 6}">${opts.panelTitle}</text>`);
@@ -413,14 +463,14 @@ function renderTimeSeries(svgId, nights, opts) {
     return;
   }
 
-  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
-  const t0 = Date.parse(nights[0].night + 'T00:00:00');
-  const t1 = Date.parse(nights[nights.length - 1].night + 'T00:00:00');
-  const xMin = Math.min(t0, tF) - 12 * 3600 * 1000;
-  const xMax = Math.max(t1, tF) + 12 * 3600 * 1000;
-
+  const [xMin, xMax] = timeDomainFor(nights);
   const yScale = v => padT + (1 - (v - opts.yMin) / (opts.yMax - opts.yMin)) * (H - padT - padB);
   const xScale = ts => padL + ((ts - xMin) / (xMax - xMin)) * (W - padL - padR);
+
+  // clipPath so the line/markers don't render outside the data area when zoomed
+  const clipId = `clip-${svgId}`;
+  svg.insertAdjacentHTML('beforeend',
+    `<defs><clipPath id="${clipId}"><rect x="${padL}" y="${padT}" width="${W - padL - padR}" height="${H - padT - padB}"/></clipPath></defs>`);
 
   for (const yt of opts.yTicks) {
     const y = yScale(yt);
@@ -429,16 +479,12 @@ function renderTimeSeries(svgId, nights, opts) {
       `<text class="axis" x="${padL - 6}" y="${y + 3}" text-anchor="end">${opts.valueFmt(yt)}</text>`);
   }
 
-  const startD = new Date(xMin), endD = new Date(xMax);
-  let cursor = new Date(startD.getFullYear(), startD.getMonth(), 1);
-  while (cursor <= endD) {
-    const x = xScale(cursor.getTime());
-    if (x >= padL && x <= W - padR) {
-      svg.insertAdjacentHTML('beforeend',
-        `<line class="gridline" x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}"/>` +
-        `<text class="axis" x="${x}" y="${H - padB + 14}" text-anchor="middle">${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}</text>`);
-    }
-    cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+  for (const tk of timeTicks(xMin, xMax)) {
+    const x = xScale(tk.t);
+    if (x < padL || x > W - padR) continue;
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="gridline" x1="${x}" y1="${padT}" x2="${x}" y2="${H - padB}"/>` +
+      `<text class="axis" x="${x}" y="${H - padB + 14}" text-anchor="middle">${tk.label}</text>`);
   }
 
   for (const r of opts.refs || []) {
@@ -448,12 +494,14 @@ function renderTimeSeries(svgId, nights, opts) {
       `<text class="ref-label" fill="${r.color}" x="${W - padR - 4}" y="${y - 4}" text-anchor="end">${r.label}</text>`);
   }
 
+  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
   const xF = xScale(tF);
-  svg.insertAdjacentHTML('beforeend',
-    `<line class="frenectomy" x1="${xF}" y1="${padT}" x2="${xF}" y2="${H - padB}"/>` +
-    `<text class="frenectomy-label" x="${xF + 4}" y="${padT + 10}">frenectomy</text>`);
+  if (xF >= padL - 1 && xF <= W - padR + 1) {
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="frenectomy" x1="${xF}" y1="${padT}" x2="${xF}" y2="${H - padB}"/>` +
+      `<text class="frenectomy-label" x="${xF + 4}" y="${padT + 10}">frenectomy</text>`);
+  }
 
-  // only nights with a non-NaN value contribute
   const valid = nights.filter(n => Number.isFinite(opts.getMedian(n)));
 
   if (valid.length > 1) {
@@ -462,17 +510,91 @@ function renderTimeSeries(svgId, nights, opts) {
       const y = yScale(opts.getMedian(n));
       return `${i === 0 ? 'M' : 'L'}${x},${y}`;
     }).join(' ');
-    svg.insertAdjacentHTML('beforeend', `<path class="${opts.lineClass}" d="${path}"/>`);
+    svg.insertAdjacentHTML('beforeend',
+      `<path class="${opts.lineClass}" clip-path="url(#${clipId})" d="${path}"/>`);
   }
 
+  // only render markers within the visible window
   for (const n of valid) {
-    const x = xScale(Date.parse(n.night + 'T00:00:00'));
+    const t = Date.parse(n.night + 'T00:00:00');
+    if (t < xMin - 12 * 3600 * 1000 || t > xMax + 12 * 3600 * 1000) continue;
+    const x = xScale(t);
     const yM = yScale(opts.getMedian(n));
     const yQ1 = yScale(opts.getQ1(n)), yQ3 = yScale(opts.getQ3(n));
     svg.insertAdjacentHTML('beforeend',
-      `<line class="${opts.iqrClass}" x1="${x}" y1="${yQ1}" x2="${x}" y2="${yQ3}"/>` +
-      `<circle class="${opts.ptClass}" cx="${x}" cy="${yM}" r="3"><title>${n.night}: ${opts.valueLabel} ${opts.valueFmt(opts.getMedian(n))}, IQR ${opts.valueFmt(opts.getQ1(n))}–${opts.valueFmt(opts.getQ3(n))}, ${n.nBreaths} breaths</title></circle>`);
+      `<line class="${opts.iqrClass}" clip-path="url(#${clipId})" x1="${x}" y1="${yQ1}" x2="${x}" y2="${yQ3}"/>` +
+      `<circle class="${opts.ptClass}" clip-path="url(#${clipId})" cx="${x}" cy="${yM}" r="3"><title>${n.night}: ${opts.valueLabel} ${opts.valueFmt(opts.getMedian(n))}, IQR ${opts.valueFmt(opts.getQ1(n))}–${opts.valueFmt(opts.getQ3(n))}, ${n.nBreaths} breaths</title></circle>`);
   }
+}
+
+// ---- zoom interaction ----
+function clientToSvgX(svg, clientX) {
+  const rect = svg.getBoundingClientRect();
+  return (clientX - rect.left) / rect.width * svg.viewBox.baseVal.width;
+}
+
+function setupZoomOn(svgId) {
+  const svg = document.getElementById(svgId);
+  const { W, padL, padR } = TS_LAYOUT;
+  let dragStart = null;
+  let overlay = null;
+
+  svg.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    if (cachedNights.length === 0) return;
+    const x = clientToSvgX(svg, e.clientX);
+    if (x < padL || x > W - padR) return;
+    dragStart = x;
+    overlay = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    overlay.setAttribute('class', 'zoom-overlay');
+    overlay.setAttribute('y', 0);
+    overlay.setAttribute('height', svg.viewBox.baseVal.height);
+    overlay.setAttribute('x', x);
+    overlay.setAttribute('width', 0);
+    svg.appendChild(overlay);
+    e.preventDefault();
+  });
+
+  svg.addEventListener('mousemove', (e) => {
+    if (dragStart === null || !overlay) return;
+    const x = clientToSvgX(svg, e.clientX);
+    const x0 = Math.max(padL, Math.min(dragStart, x));
+    const x1 = Math.min(W - padR, Math.max(dragStart, x));
+    overlay.setAttribute('x', x0);
+    overlay.setAttribute('width', Math.max(0, x1 - x0));
+  });
+
+  const finishDrag = (e) => {
+    if (dragStart === null) return;
+    const x = clientToSvgX(svg, e.clientX);
+    const x0 = Math.max(padL, Math.min(dragStart, x));
+    const x1 = Math.min(W - padR, Math.max(dragStart, x));
+    dragStart = null;
+    if (overlay) { overlay.remove(); overlay = null; }
+    if (x1 - x0 < 5) return;
+    const [xMin, xMax] = timeDomainFor(cachedNights);
+    const tStart = xMin + (x0 - padL) / (W - padL - padR) * (xMax - xMin);
+    const tEnd = xMin + (x1 - padL) / (W - padL - padR) * (xMax - xMin);
+    setZoom({ tMin: tStart, tMax: tEnd });
+  };
+  window.addEventListener('mouseup', finishDrag);
+  svg.addEventListener('mouseleave', () => {
+    if (dragStart !== null && overlay) { overlay.remove(); overlay = null; dragStart = null; }
+  });
+
+  svg.addEventListener('dblclick', () => setZoom(null));
+}
+
+function setZoom(domain) {
+  zoomDomain = domain;
+  document.getElementById('zoom-reset').style.display = domain ? '' : 'none';
+  redrawCharts();
+}
+
+function redrawCharts() {
+  renderPeakChart(cachedNights);
+  renderSkewChart(cachedNights);
+  renderPhaseChart(cachedNights);
 }
 
 function renderPeakChart(nights) {
@@ -778,11 +900,11 @@ function setStatus(msg, isErr = false) {
 async function refresh() {
   const all = await dbAll();
   const nights = longestPerNight(all);
+  cachedNights = nights;
   countEl.textContent = nights.length === 0
     ? ''
     : `${nights.length} night${nights.length === 1 ? '' : 's'} · ${all.length} session${all.length === 1 ? '' : 's'} stored`;
 
-  // backfill banner: nights stored before insp_skew was tracked
   const needsSkew = nights.filter(n => !Number.isFinite(n.skewMedian)).length;
   const banner = document.getElementById('backfill');
   if (needsSkew > 0) {
@@ -797,6 +919,25 @@ async function refresh() {
   renderPhaseChart(nights);
   renderTable(nights);
 }
+
+setupZoomOn('chart-peak');
+setupZoomOn('chart-skew');
+
+document.getElementById('zoom-post').addEventListener('click', () => {
+  const tF = Date.parse(FRENECTOMY + 'T00:00:00');
+  const dayMs = 86400 * 1000;
+  // 1 week pre-frenectomy through latest data + 1 day
+  const tEnd = cachedNights.length
+    ? Math.max(tF, Date.parse(cachedNights[cachedNights.length - 1].night + 'T00:00:00')) + dayMs
+    : tF + 30 * dayMs;
+  setZoom({ tMin: tF - 7 * dayMs, tMax: tEnd });
+});
+
+document.getElementById('zoom-reset').addEventListener('click', () => setZoom(null));
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && zoomDomain) setZoom(null);
+});
 
 document.getElementById('clear').addEventListener('click', async () => {
   if (!confirm('delete all stored sessions? this cannot be undone.')) return;
