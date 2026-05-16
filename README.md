@@ -16,6 +16,20 @@ Built for personal flow-shape tracking around interventions like surgeries, mask
 - User-managed event markers (surgeries, settings changes, etc.) render as dashed vertical lines on both time charts and ring the first night-after on the phase scatter.
 - Horizontal-only zoom (drag to select range, double-click / Esc / button to reset; "last 30 days" preset).
 
+## Companion tool — `hjorth.html`
+
+A sibling page in this repo for a different question: not the *shape* of individual breaths, but the *periodic-breathing / loop-gain instability* of the night as a whole.
+
+- Builds a minute-ventilation proxy (mean |flow| in 0.5 s bins → uniform 2 Hz envelope), then a Welch PSD of it.
+- Computes **Hjorth descriptors as normalized spectral moments over the loop-gain band (0.005–0.05 Hz, period 20–200 s)**:
+  - **complexity** — 1.0 for a clean sinusoidal oscillation (textbook Cheyne–Stokes), higher for broadband / chaotic instability.
+  - **period (s)** — the dominant loop-gain cycle length (1 / spectral centroid).
+  - **band fraction** — share of envelope power in the band; a relative `csr_frac`-style anchor.
+- Per-segment values → nightly median + IQR; click a row for that night's Welch PSD with the band shaded.
+- Shares the same scaffold: BRP-only EDF parsing, longest-per-night aggregation, IndexedDB, event markers, horizontal zoom, JSON export — plus a rolling-median trend line, adaptive date axis, optional log-Y, and a hover value readout.
+
+Caveat: the band fraction is *not* numerically comparable to a PLD/minute-ventilation-derived `csr_frac` — different source signal and normalization. Treat complexity and period (normalization-independent ratios) as the headline metrics and track them longitudinally against your event markers.
+
 ## What the metrics mean
 
 Both metrics describe *where in inspiration* the flow concentrates. They sit on the same axis but read it differently.
